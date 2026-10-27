@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 import io
 import re
 from collections import Counter
@@ -30,8 +31,10 @@ def client(key: str):
     return create_client(st.secrets['SUPABASE_URL'], st.secrets[key])
 
 
+@st.cache_resource
 def service():
-    # This service-role key stays on the Streamlit server; NEVER put it in browser code or Git.
+    # Shared service client is used only for table operations, never user authentication.
+    # The key remains on the Streamlit server.
     return client('SUPABASE_SERVICE_ROLE_KEY')
 
 
@@ -121,6 +124,79 @@ def fetch_all(table, cols='*', page_size=500):
     return out
 
 
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_papers():
+    # Avoid downloading ~4,800 paper records every time a reviewer clicks Next.
+    return sorted(fetch_all('papers'), key=lambda x: (x.get('publication_year') or '', x.get('title') or '', x['id']))
+
+
+def invalidate_papers_cache():
+    load_papers.clear()
+
+
+def load_reviewer_votes(uid):
+    # A private session-local cache: NEVER shared across reviewers.
+    key = 'my_votes_cache'
+    if st.session_state.get('my_votes_uid') != uid or key not in st.session_state:
+        all_votes = []
+        db = service()
+        offset = 0
+        while True:
+            batch = (db.table('votes').select('paper_id,decision,note')
+                     .eq('reviewer_id', uid).range(offset, offset + 499).execute().data or [])
+            all_votes.extend(batch)
+            if len(batch) < 500:
+                break
+            offset += 500
+        st.session_state[key] = {v['paper_id']: v for v in all_votes}
+        st.session_state['my_votes_uid'] = uid
+    return st.session_state[key]
+
+def save_vote_to_db(record):
+    """Worker: success only after Supabase confirms the write; exceptions propagate."""
+    service().table('votes').upsert(record, on_conflict='paper_id,reviewer_id').execute()
+    return True
+
+
+def vote_queue():
+    """One worker per browser session ensures edits to the same paper retain order."""
+    if 'vote_executor' not in st.session_state:
+        st.session_state['vote_executor'] = ThreadPoolExecutor(max_workers=1)
+    return st.session_state['vote_executor']
+
+
+def sync_queued_votes():
+    """Collect completed results, never mislabel unconfirmed writes as saved."""
+    queue = st.session_state.setdefault('queued_votes', {})
+    votes = st.session_state.get('my_votes_cache', {})
+    for pid, item in list(queue.items()):
+        f = item['future']
+        if not f.done():
+            continue
+        try:
+            f.result()
+        except Exception as exc:
+            item['error'] = str(exc)
+        else:
+            votes[pid] = item['vote']
+            del queue[pid]
+    return queue
+
+
+def schedule_vote(record):
+    queue = st.session_state.setdefault('queued_votes', {})
+    pid = record['paper_id']
+    # Don't silently overwrite an in-flight queue entry; callers can retry later.
+    if pid in queue and not queue[pid]['future'].done():
+        return False
+    future = vote_queue().submit(save_vote_to_db, record.copy())
+    queue[pid] = {'future': future,
+                  'vote': {'paper_id': pid, 'decision': record['decision'], 'note': record['note']},
+                  'record': record.copy(), 'error': None}
+    return True
+
+
 def auth_user():
     token = st.session_state.get('token')
     if not token:
@@ -168,38 +244,73 @@ def page_header(profile):
     a, b = st.columns([5, 1])
     a.title('LLM Routing Literature Screening')
     a.caption(f"Signed in: {profile['email']}  ·  {profile['role'].title()}")
-    if b.button('Sign out'):
-        for k in ('token', 'refresh_token', 'paper_idx', 'paper_id'):
+    queued = st.session_state.get('queued_votes', {})
+    if b.button('Sign out', disabled=bool(queued), help='Confirm or retry pending saves before signing out.'):
+        for k in ('token', 'refresh_token', 'paper_idx', 'paper_id', 'my_votes_cache', 'my_votes_uid', 'jump_number'):
             st.session_state.pop(k, None)
         st.rerun()
 
 
+@st.fragment
 def reviewer_view(uid):
-    papers = sorted(fetch_all('papers'), key=lambda x: (x.get('publication_year') or '', x.get('title') or '', x['id']))
+    papers = load_papers()
     if not papers:
         st.info('No papers have been imported yet. Ask the administrator to upload an Excel file.')
         return
-    own = service().table('votes').select('paper_id,decision,note').eq('reviewer_id', uid).execute().data or []
-    votes = {v['paper_id']: v for v in own}
+    votes = load_reviewer_votes(uid)
+    queue = sync_queued_votes()
+    failed = {pid: entry for pid, entry in queue.items() if entry.get('error')}
+    pending = len(queue) - len(failed)
     completed = len(votes)
-    st.progress(completed / len(papers), text=f'Your progress: {completed} / {len(papers)} ({completed / len(papers):.1%})')
+    st.progress(completed / len(papers), text=f'Confirmed saved: {completed} / {len(papers)} ({completed / len(papers):.1%})')
+    if pending:
+        st.info(f'{pending} decision(s) are still saving to Supabase. You can continue screening; do not close the page until they are confirmed.')
+    if failed:
+        st.error(f'{len(failed)} decision(s) FAILED to save. They remain available for retry in this browser session.')
+        if st.button('Retry failed saves', type='primary'):
+            for pid, item in failed.items():
+                schedule_vote(item['record'])
+            st.rerun(scope='fragment')
+    if queue and st.button('Check save status'):
+        st.rerun(scope='fragment')
+    # Include queued submissions for navigation only; counts above remain confirmed-only.
+    effective_votes = {**votes, **{pid: x['vote'] for pid, x in queue.items()}}
+
     filter_mode = st.radio('Show', ['All', 'Unscreened', 'Screened', 'Uncertain'], horizontal=True)
     visible = [p for p in papers if (filter_mode == 'All' or
-        (filter_mode == 'Unscreened' and p['id'] not in votes) or
-        (filter_mode == 'Screened' and p['id'] in votes) or
-        (filter_mode == 'Uncertain' and votes.get(p['id'], {}).get('decision') == 'uncertain'))]
+        (filter_mode == 'Unscreened' and p['id'] not in effective_votes) or
+        (filter_mode == 'Screened' and p['id'] in effective_votes) or
+        (filter_mode == 'Uncertain' and effective_votes.get(p['id'], {}).get('decision') == 'uncertain'))]
     if not visible:
         st.success('No papers in this view.')
         return
     idlist = [p['id'] for p in visible]
-    if st.session_state.get('paper_id') not in idlist:
+    positions = {pid: i for i, pid in enumerate(idlist)}
+    if st.session_state.get('paper_id') not in positions:
         st.session_state['paper_id'] = idlist[0]
-    chosen = st.selectbox('Jump to paper', idlist, index=idlist.index(st.session_state['paper_id']),
-                          format_func=lambda pid: f"{idlist.index(pid)+1}. {next(p['title'] for p in visible if p['id']==pid)[:110]}")
-    st.session_state['paper_id'] = chosen
-    index = idlist.index(chosen)
+    index = positions[st.session_state['paper_id']]
     paper = visible[index]
-    st.divider()
+
+    # A numeric jump is intentionally used instead of rendering a 4,800-item
+    # selectbox with an expensive format_func on EVERY navigation.
+    nav_a, nav_b, nav_c = st.columns([1, 2, 1])
+    with nav_a:
+        if st.button('← Previous', disabled=index == 0, use_container_width=True):
+            st.session_state['paper_id'] = idlist[index - 1]
+            st.rerun(scope='fragment')
+    with nav_b:
+        with st.form('jump_form'):
+            jump_a, jump_b = st.columns([3, 1])
+            target = jump_a.number_input('Paper number', min_value=1, max_value=len(visible),
+                                         value=index + 1, step=1, label_visibility='collapsed')
+            if jump_b.form_submit_button('Go', use_container_width=True):
+                st.session_state['paper_id'] = idlist[int(target) - 1]
+                st.rerun(scope='fragment')
+    with nav_c:
+        if st.button('Next →', disabled=index == len(idlist) - 1, use_container_width=True):
+            st.session_state['paper_id'] = idlist[index + 1]
+            st.rerun(scope='fragment')
+
     st.caption(f'Paper {index + 1} of {len(visible)} · {paper.get("item_type") or "Publication"} · {paper.get("publication_year") or "Year unknown"}')
     st.subheader(paper['title'])
     st.markdown(f"**Authors:** {paper.get('author') or 'Not supplied'}")
@@ -210,27 +321,29 @@ def reviewer_view(uid):
         st.link_button('Open paper / publisher URL', url)
     st.markdown('#### Abstract')
     st.write(paper.get('abstract') or 'No abstract provided in the imported file.')
-    old = votes.get(paper['id'], {})
+    old = effective_votes.get(paper['id'], {})
     choices = ['yes', 'no', 'uncertain']
     labels = {'yes': 'Yes — LLM routing', 'no': 'No — not LLM routing', 'uncertain': 'Uncertain — needs full-text review'}
     with st.form('vote_' + paper['id']):
-        choice = st.radio('Decision', choices, index=choices.index(old['decision']) if old.get('decision') in choices else None,
-                          format_func=lambda s: labels[s])
+        choice = st.radio('Decision', choices,
+                          index=choices.index(old['decision']) if old.get('decision') in choices else None,
+                          format_func=lambda value: labels[value])
         note = st.text_area('Reason / note (optional)', value=old.get('note', ''), max_chars=2000)
         save = st.form_submit_button('Save decision & next', type='primary', disabled=choice is None)
     if save:
-        service().table('votes').upsert({'paper_id': paper['id'], 'reviewer_id': uid, 'decision': choice, 'note': note.strip()},
-                                         on_conflict='paper_id,reviewer_id').execute()
-        st.session_state['paper_id'] = idlist[min(index+1, len(idlist)-1)]
-        st.rerun()
-    back, forward = st.columns(2)
-    if back.button('← Previous', disabled=index == 0):
-        st.session_state['paper_id'] = idlist[index-1]
-        st.rerun()
-    if forward.button('Next →', disabled=index == len(idlist)-1):
-        st.session_state['paper_id'] = idlist[index+1]
-        st.rerun()
-    st.caption('Your answers are private to other reviewers. You can revisit and edit any saved decision.')
+        record = {'paper_id': paper['id'], 'reviewer_id': uid, 'decision': choice, 'note': note.strip()}
+        if not schedule_vote(record):
+            st.warning('This paper is still saving. Check save status before editing it again.')
+            return
+        # Continue from the subsequent paper. In Unscreened mode, the saved
+        # paper disappears, so the next item moves into its previous position.
+        if filter_mode == 'Unscreened':
+            next_idx = min(index, len(idlist) - 2)
+            st.session_state['paper_id'] = idlist[index + 1] if index + 1 < len(idlist) else (idlist[index - 1] if index else None)
+        else:
+            st.session_state['paper_id'] = idlist[min(index + 1, len(idlist) - 1)]
+        st.rerun(scope='fragment')
+    st.caption('Save & next advances immediately. Database writes are queued; only confirmed writes count toward progress. Check pending saves before signing out or closing the tab.')
 
 
 def screening_status(votes):
@@ -330,6 +443,7 @@ def admin_view():
                     db = service()
                     for i in range(0, len(recs), 100):
                         db.table('papers').upsert(recs[i:i+100], on_conflict='fingerprint').execute()
+                    invalidate_papers_cache()
                     st.success(f'{len(recs)} distinct publications imported or updated.')
             except Exception as exc:
                 st.error(f'Import error: {exc}')
