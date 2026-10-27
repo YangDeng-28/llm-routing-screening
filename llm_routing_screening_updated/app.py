@@ -302,23 +302,24 @@ def reviewer_view(uid):
     st.markdown('#### Abstract')
     st.write(paper.get('abstract') or 'No abstract provided in the imported file.')
     old = effective_votes.get(paper['id'], {})
-    # Per-paper widget key prevents unsaved notes from leaking to the next paper.
-    note = st.text_area('Reason / note (optional)', value=old.get('note', ''),
-                        max_chars=2000, key='note_' + paper['id'])
+
     saving_this_paper = paper['id'] in queue and not queue[paper['id']]['future'].done()
     st.markdown('**Choose a decision to save and continue:**')
     yes_col, no_col, uncertain_col = st.columns(3)
     with yes_col:
-        yes_clicked = st.button('Yes & Next', type='primary', use_container_width=True,
+        yes_clicked = st.button('Yes', type='primary', use_container_width=True,
                                 disabled=saving_this_paper)
     with no_col:
-        no_clicked = st.button('No & Next', use_container_width=True,
+        no_clicked = st.button('No', use_container_width=True,
                                disabled=saving_this_paper)
     with uncertain_col:
-        uncertain_clicked = st.button('Uncertain & Next', use_container_width=True,
+        uncertain_clicked = st.button('Uncertain', use_container_width=True,
                                       disabled=saving_this_paper)
     decision = ('yes' if yes_clicked else 'no' if no_clicked else
                 'uncertain' if uncertain_clicked else None)
+    # Per-paper widget key prevents unsaved notes from leaking to the next paper.
+    note = st.text_area('备注', value=old.get('note', ''),
+                        max_chars=2000, key='note_' + paper['id'])
     if decision is not None:
         record = {'paper_id': paper['id'], 'reviewer_id': uid,
                   'decision': decision, 'note': note.strip()}
