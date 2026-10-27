@@ -291,6 +291,49 @@ def reviewer_view(uid):
     index = positions[st.session_state['paper_id']]
     paper = visible[index]
 
+    st.caption(f'Paper {index + 1} of {len(visible)} · {paper.get("item_type") or "Publication"} · {paper.get("publication_year") or "Year unknown"}')
+    st.subheader(paper['title'])
+    st.markdown(f"**Authors:** {paper.get('author') or 'Not supplied'}")
+    st.markdown(f"**Venue:** {paper.get('publication_title') or 'Not supplied'}")
+    st.markdown(f"**DOI:** {paper.get('doi') or 'Not supplied'}")
+    url = paper.get('url') or ''
+    if valid_http_url(url):
+        st.link_button('Open paper / publisher URL', url)
+    st.markdown('#### Abstract')
+    st.write(paper.get('abstract') or 'No abstract provided in the imported file.')
+    old = effective_votes.get(paper['id'], {})
+    # Per-paper widget key prevents unsaved notes from leaking to the next paper.
+    note = st.text_area('Reason / note (optional)', value=old.get('note', ''),
+                        max_chars=2000, key='note_' + paper['id'])
+    saving_this_paper = paper['id'] in queue and not queue[paper['id']]['future'].done()
+    st.markdown('**Choose a decision to save and continue:**')
+    yes_col, no_col, uncertain_col = st.columns(3)
+    with yes_col:
+        yes_clicked = st.button('Yes & Next', type='primary', use_container_width=True,
+                                disabled=saving_this_paper)
+    with no_col:
+        no_clicked = st.button('No & Next', use_container_width=True,
+                               disabled=saving_this_paper)
+    with uncertain_col:
+        uncertain_clicked = st.button('Uncertain & Next', use_container_width=True,
+                                      disabled=saving_this_paper)
+    decision = ('yes' if yes_clicked else 'no' if no_clicked else
+                'uncertain' if uncertain_clicked else None)
+    if decision is not None:
+        record = {'paper_id': paper['id'], 'reviewer_id': uid,
+                  'decision': decision, 'note': note.strip()}
+        if not schedule_vote(record):
+            st.warning('This paper is still saving. Check save status before editing it again.')
+            return
+        # In Unscreened mode, the current paper vanishes from the filtered
+        # results; advance by identity, not by an index in the old list.
+        if index + 1 < len(idlist):
+            st.session_state['paper_id'] = idlist[index + 1]
+        elif index > 0:
+            st.session_state['paper_id'] = idlist[index - 1]
+        else:
+            st.session_state['paper_id'] = None
+        st.rerun(scope='fragment')
     # A numeric jump is intentionally used instead of rendering a 4,800-item
     # selectbox with an expensive format_func on EVERY navigation.
     nav_a, nav_b, nav_c = st.columns([1, 2, 1])
@@ -311,39 +354,8 @@ def reviewer_view(uid):
             st.session_state['paper_id'] = idlist[index + 1]
             st.rerun(scope='fragment')
 
-    st.caption(f'Paper {index + 1} of {len(visible)} · {paper.get("item_type") or "Publication"} · {paper.get("publication_year") or "Year unknown"}')
-    st.subheader(paper['title'])
-    st.markdown(f"**Authors:** {paper.get('author') or 'Not supplied'}")
-    st.markdown(f"**Venue:** {paper.get('publication_title') or 'Not supplied'}")
-    st.markdown(f"**DOI:** {paper.get('doi') or 'Not supplied'}")
-    url = paper.get('url') or ''
-    if valid_http_url(url):
-        st.link_button('Open paper / publisher URL', url)
-    st.markdown('#### Abstract')
-    st.write(paper.get('abstract') or 'No abstract provided in the imported file.')
-    old = effective_votes.get(paper['id'], {})
-    choices = ['yes', 'no', 'uncertain']
-    labels = {'yes': 'Yes — LLM routing', 'no': 'No — not LLM routing', 'uncertain': 'Uncertain — needs full-text review'}
-    with st.form('vote_' + paper['id']):
-        choice = st.radio('Decision', choices,
-                          index=choices.index(old['decision']) if old.get('decision') in choices else None,
-                          format_func=lambda value: labels[value])
-        note = st.text_area('Reason / note (optional)', value=old.get('note', ''), max_chars=2000)
-        save = st.form_submit_button('Save decision & next', type='primary', disabled=choice is None)
-    if save:
-        record = {'paper_id': paper['id'], 'reviewer_id': uid, 'decision': choice, 'note': note.strip()}
-        if not schedule_vote(record):
-            st.warning('This paper is still saving. Check save status before editing it again.')
-            return
-        # Continue from the subsequent paper. In Unscreened mode, the saved
-        # paper disappears, so the next item moves into its previous position.
-        if filter_mode == 'Unscreened':
-            next_idx = min(index, len(idlist) - 2)
-            st.session_state['paper_id'] = idlist[index + 1] if index + 1 < len(idlist) else (idlist[index - 1] if index else None)
-        else:
-            st.session_state['paper_id'] = idlist[min(index + 1, len(idlist) - 1)]
-        st.rerun(scope='fragment')
-    st.caption('Save & next advances immediately. Database writes are queued; only confirmed writes count toward progress. Check pending saves before signing out or closing the tab.')
+    st.divider()
+    st.caption('Each decision button queues a save and advances immediately. Database writes are queued; only confirmed writes count toward progress. Check pending saves before signing out or closing the tab.')
 
 
 def screening_status(votes):
